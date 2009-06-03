@@ -18,6 +18,8 @@
 
 /* TODO
  * - set LIBKETAMA_COMPATIBLE as the default?
+ * - consider setOptions()
+ * - fix unserialize(serialize($memc))
  */
 
 #ifdef HAVE_CONFIG_H
@@ -68,6 +70,12 @@
 #define MEMC_VAL_IS_DOUBLE     (1<<3)
 #define MEMC_VAL_IGBINARY      (1<<4)
 #define MEMC_VAL_IS_BOOL       (1<<5)
+
+/****************************************
+  "get" operation flags
+****************************************/
+#define MEMC_GET_PRESERVE_ORDER (1<<0)
+
 
 #define MEMC_COMPRESS_THRESHOLD 100
 
@@ -414,6 +422,7 @@ static void php_memc_get_impl(INTERNAL_FUNCTION_PARAMETERS, zend_bool by_key)
 		uint32_t dummy_flags;
 		int rc;
 		memcached_return dummy_status;
+		bool return_value_set = false;
 
 		status = memcached_mget_by_key(i_obj->memc, server_key, server_key_len, &key, &key_len, 1);
 		payload = memcached_fetch(i_obj->memc, NULL, NULL, &payload_len, &flags, &status);
@@ -424,10 +433,12 @@ static void php_memc_get_impl(INTERNAL_FUNCTION_PARAMETERS, zend_bool by_key)
 		/*
 		 * If payload wasn't found and we have a read-through callback, invoke it to get
 		 * the value. The callback will take care of storing the value back into memcache.
+		 * The callback will set the return value.
 		 */
 		if (payload == NULL && status == MEMCACHED_NOTFOUND && fci.size != 0) {
 			status = php_memc_do_cache_callback(getThis(), &fci, &fcc, key, key_len,
 												return_value TSRMLS_CC);
+			return_value_set = true;
 		}
 
 		(void)memcached_fetch(i_obj->memc, NULL, NULL, &dummy_length, &dummy_flags, &dummy_status);
@@ -439,8 +450,8 @@ static void php_memc_get_impl(INTERNAL_FUNCTION_PARAMETERS, zend_bool by_key)
 			RETURN_FALSE;
 		}
 
-		/* payload will be NULL if the callback was invoked */
-		if (payload != NULL) {
+		/* if memcached gave a value and there was no callback, payload may be NULL */
+		if (!return_value_set) {
 			rc = php_memc_zval_from_payload(return_value, payload, payload_len, flags TSRMLS_CC);
 			free(payload);
 			if (rc < 0) {
@@ -488,19 +499,20 @@ static void php_memc_getMulti_impl(INTERNAL_FUNCTION_PARAMETERS, zend_bool by_ke
 	zval *cas_tokens = NULL;
 	uint64_t orig_cas_flag;
 	zval *value;
-	zend_bool preserve_order = 0;  
+	long get_flags = 0;
 	int i = 0;
+	zend_bool preserve_order;
 	memcached_result_st result;
 	memcached_return status = MEMCACHED_SUCCESS;
 	MEMC_METHOD_INIT_VARS;
 
 	if (by_key) {
-		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "sa|zb", &server_key,
-								  &server_key_len, &keys, &cas_tokens,&preserve_order) == FAILURE) {
+		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "sa|zl", &server_key,
+								  &server_key_len, &keys, &cas_tokens, &get_flags) == FAILURE) {
 			return;
 		}
 	} else {
-		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "a|zb", &keys, &cas_tokens, &preserve_order) == FAILURE) {
+		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "a|zl", &keys, &cas_tokens, &get_flags) == FAILURE) {
 			return;
 		}
 	}
@@ -508,6 +520,7 @@ static void php_memc_getMulti_impl(INTERNAL_FUNCTION_PARAMETERS, zend_bool by_ke
 	MEMC_METHOD_FETCH_OBJECT;
 	MEMC_G(rescode) = MEMCACHED_SUCCESS;
 
+	preserve_order = (get_flags & MEMC_GET_PRESERVE_ORDER);
 	num_keys  = zend_hash_num_elements(Z_ARRVAL_P(keys));
 	mkeys     = safe_emalloc(num_keys, sizeof(char *), 0);
 	mkeys_len = safe_emalloc(num_keys, sizeof(size_t), 0);
@@ -524,8 +537,8 @@ static void php_memc_getMulti_impl(INTERNAL_FUNCTION_PARAMETERS, zend_bool by_ke
 		if (Z_TYPE_PP(entry) == IS_STRING && Z_STRLEN_PP(entry) > 0) {
 			mkeys[i]     = Z_STRVAL_PP(entry);
 			mkeys_len[i] = Z_STRLEN_PP(entry);
-			if(preserve_order) {
-			 add_assoc_null_ex(return_value, mkeys[i], mkeys_len[i]+1);
+			if (preserve_order) {
+				add_assoc_null_ex(return_value, mkeys[i], mkeys_len[i]+1);
 			}
 			i++;
 		}
@@ -573,7 +586,6 @@ static void php_memc_getMulti_impl(INTERNAL_FUNCTION_PARAMETERS, zend_bool by_ke
 		zval_dtor(cas_tokens);
 		array_init(cas_tokens);
 	}
-	
 	status = MEMCACHED_SUCCESS;
 	memcached_result_create(i_obj->memc, &result);
 	while ((memcached_fetch_result(i_obj->memc, &result, &status)) != NULL) {
@@ -1944,7 +1956,6 @@ static char *php_memc_zval_to_payload(zval *value, size_t *payload_len, uint32_t
 			} else {
 #endif
 				php_serialize_data_t var_hash;
-
 				PHP_VAR_SERIALIZE_INIT(var_hash);
 				php_var_serialize(&buf, &value, &var_hash TSRMLS_CC);
 				PHP_VAR_SERIALIZE_DESTROY(var_hash);
@@ -1964,7 +1975,7 @@ static char *php_memc_zval_to_payload(zval *value, size_t *payload_len, uint32_t
 	}
 
 	/* turn off compression for values below the threshold */
-	if (buf.len < MEMC_COMPRESS_THRESHOLD) {
+	if ((*flags & MEMC_VAL_COMPRESSED) && buf.len < MEMC_COMPRESS_THRESHOLD) {
 		*flags &= ~MEMC_VAL_COMPRESSED;
 	}
 
@@ -1994,8 +2005,16 @@ static char *php_memc_zval_to_payload(zval *value, size_t *payload_len, uint32_t
 
 static int php_memc_zval_from_payload(zval *value, char *payload, size_t payload_len, uint32_t flags TSRMLS_DC)
 {
-	if (payload == NULL) {
+	/*
+	   A NULL payload is completely valid if length is 0, it is simply empty.
+	 */
+	char dummy_payload[1] = { 0 };
+	if (payload == NULL && payload_len > 0) {
+		php_error_docref(NULL TSRMLS_CC, E_WARNING,
+			"Could not handle non-existing value of length %zu", payload_len);
 		return -1;
+	} else if (payload == NULL) {
+		payload = dummy_payload;
 	}
 
 	if (flags & MEMC_VAL_COMPRESSED) {
@@ -2074,8 +2093,7 @@ static int php_memc_zval_from_payload(zval *value, char *payload, size_t payload
 			double dval = zend_strtod(payload, NULL);
 			ZVAL_DOUBLE(value, dval);
 		} else if (flags & MEMC_VAL_IS_BOOL) {
-			long bval = strtol(payload, NULL, 10);
-			ZVAL_BOOL(value, bval);
+			ZVAL_BOOL(value, payload_len > 0 && payload[0] == '1');
 		} else {
 			ZVAL_STRINGL(value, payload, payload_len, 1);
 		}
@@ -2448,14 +2466,14 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_INFO_EX(arginfo_getMulti, 0, 0, 1)
 	ZEND_ARG_ARRAY_INFO(0, keys, 0)
 	ZEND_ARG_INFO(1, cas_tokens)
-	ZEND_ARG_INFO(0, preserve_order)
+	ZEND_ARG_INFO(0, flags)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_getMultiByKey, 0, 0, 2)
 	ZEND_ARG_INFO(0, server_key)
 	ZEND_ARG_ARRAY_INFO(0, keys, 0)
 	ZEND_ARG_INFO(1, cas_tokens)
-	ZEND_ARG_INFO(0, preserve_order)
+	ZEND_ARG_INFO(0, flags)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_getDelayed, 0, 0, 1)
@@ -2730,6 +2748,16 @@ static void php_memc_register_constants(INIT_FUNC_ARGS)
 	REGISTER_MEMC_CLASS_CONST_LONG(OPT_PREFIX_KEY,  MEMC_OPT_PREFIX_KEY);
 	REGISTER_MEMC_CLASS_CONST_LONG(OPT_SERIALIZER,  MEMC_OPT_SERIALIZER);
 
+
+	/*
+	 * Indicate whether igbinary serializer is available
+	 */
+#ifdef HAVE_MEMCACHED_IGBINARY
+	REGISTER_MEMC_CLASS_CONST_LONG(IGBINARY_SUPPORT, 1);
+#else
+	REGISTER_MEMC_CLASS_CONST_LONG(IGBINARY_SUPPORT, 0);
+#endif
+
 	/*
 	 * libmemcached behavior options
 	 */
@@ -2799,6 +2827,10 @@ static void php_memc_register_constants(INIT_FUNC_ARGS)
 	REGISTER_MEMC_CLASS_CONST_LONG(SERIALIZER_PHP, SERIALIZER_PHP);
 	REGISTER_MEMC_CLASS_CONST_LONG(SERIALIZER_IGBINARY, SERIALIZER_IGBINARY);
 
+	/*
+	 * Flags.
+	 */
+	REGISTER_MEMC_CLASS_CONST_LONG(GET_PRESERVE_ORDER, MEMC_GET_PRESERVE_ORDER);
 
 	#undef REGISTER_MEMC_CLASS_CONST_LONG
 }
